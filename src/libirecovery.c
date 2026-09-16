@@ -3756,6 +3756,8 @@ irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, un
 		if (irecv_usb_control_transfer(client, 0xa1, 5, 0, 0, (unsigned char*)&state, 1, USB_TIMEOUT) == 1) {
 			error = IRECV_E_SUCCESS;
 		} else {
+			fprintf(stderr, "irecv_send_buffer: pre-upload DFU GETSTATUS control transfer failed "
+			                "(device may have just dropped off USB)\n");
 			return IRECV_E_USB_UPLOAD;
 		}
 		switch (state) {
@@ -3765,18 +3767,21 @@ irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, un
 		case 8:
 			/* DFU WAIT RESET */
 			if (!isiOS2) {
-				debug("Unexpected state %d in non-iOS2 mode!, issuing ABORT\n", state);
+				fprintf(stderr, "irecv_send_buffer: device reported DFU state 8 (WAIT_RESET) before any data "
+				                "was sent, issuing ABORT\n");
 				irecv_usb_control_transfer(client, 0x21, 6, 0, 0, NULL, 0, USB_TIMEOUT);
 				error = IRECV_E_USB_UPLOAD;
 			}
 			break;
 		case 10:
-			debug("DFU ERROR, issuing CLRSTATUS\n");
+			fprintf(stderr, "irecv_send_buffer: device reported DFU state 10 (dfuERROR) before any data was "
+			                "sent, issuing CLRSTATUS\n");
 			irecv_usb_control_transfer(client, 0x21, 4, 0, 0, NULL, 0, USB_TIMEOUT);
 			error = IRECV_E_USB_UPLOAD;
 			break;
 		default:
-			debug("Unexpected state %d, issuing ABORT\n", state);
+			fprintf(stderr, "irecv_send_buffer: device reported unexpected DFU state %d before any data was "
+			                "sent, issuing ABORT\n", state);
 			irecv_usb_control_transfer(client, 0x21, 6, 0, 0, NULL, 0, USB_TIMEOUT);
 			error = IRECV_E_USB_UPLOAD;
 			break;
@@ -3813,6 +3818,9 @@ irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, un
 				if (size+16 > packet_size) {
 					bytes = irecv_usb_control_transfer(client, 0x21, 1, i, 0, &buffer[i * packet_size], size, USB_TIMEOUT);
 					if (bytes != size) {
+						fprintf(stderr, "irecv_send_buffer: short write on final-packet CRC-trailer split "
+						                "(packet %d/%d): wrote %d of %d bytes -- device likely dropped off USB "
+						                "mid-transfer\n", i + 1, packets, bytes, size);
 						return IRECV_E_USB_UPLOAD;
 					}
 					count += size;
@@ -3845,6 +3853,10 @@ irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, un
 		}
 
 		if (bytes != size) {
+			fprintf(stderr, "irecv_send_buffer: short write on packet %d/%d (%s): wrote %d of %d bytes -- "
+			                "device likely dropped off USB mid-transfer\n", i + 1, packets,
+			                legacy_recovery_mode ? "interrupt" : (recovery_mode ? "bulk" : "control"), bytes,
+			                size);
 			return IRECV_E_USB_UPLOAD;
 		}
 
@@ -3853,6 +3865,8 @@ irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, un
 		}
 
 		if (error != IRECV_E_SUCCESS) {
+			fprintf(stderr, "irecv_send_buffer: GETSTATUS failed after packet %d/%d: %s\n", i + 1, packets,
+			                irecv_strerror(error));
 			return error;
 		}
 
@@ -3868,6 +3882,10 @@ irecv_error_t irecv_send_buffer(irecv_client_t client, unsigned char* buffer, un
 			}
 
 			if (status != 5) {
+				fprintf(stderr, "irecv_send_buffer: device never reported DFU state 5 (dfuDNLOAD-IDLE) after "
+				                "packet %d/%d, even after 20 one-second GETSTATUS retries (last status: %u) -- "
+				                "the device most likely disconnected partway through this packet\n", i + 1,
+				                packets, status);
 				return IRECV_E_USB_UPLOAD;
 			}
 		}
