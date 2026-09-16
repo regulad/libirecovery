@@ -105,6 +105,11 @@ struct irecv_async_transfer {
  	kern_return_t ret;
  #else
  	enum libusb_transfer_status ret;
+ 	/* Whether the completion callback has run at all. `ret` alone cannot
+ 	   answer that on the libusb side: it is bzero'd before the transfer is
+ 	   submitted, and LIBUSB_TRANSFER_COMPLETED is itself 0, so "not
+ 	   finished yet" and "finished successfully" are the same value. */
+ 	volatile int completed;
  #endif
 };
 
@@ -1531,6 +1536,7 @@ static void async_cb(struct libusb_transfer* usb_transfer) {
 	struct irecv_async_transfer* transfer = usb_transfer->user_data;
 	transfer->ret = usb_transfer->status;
 	transfer->len += usb_transfer->actual_length;
+	transfer->completed = 1;
 }
 
 #endif
@@ -1611,26 +1617,44 @@ IRECV_API int irecv_async_usb_control_transfer_with_cancel(irecv_client_t client
 	memcpy((buffer + 8), data, w_length);
 	libusb_fill_control_setup(buffer, bm_request_type, b_request, w_value, w_index, w_length);
 	libusb_fill_control_transfer(usb_transfer, client->handle, buffer, async_cb, &transfer, 0);
+	/* From here on libusb owns `buffer` and releases it inside
+	   libusb_free_transfer(); it must not be freed separately. This used
+	   to free(buffer) explicitly *while the transfer was still queued*
+	   and leave LIBUSB_TRANSFER_FREE_BUFFER set as well -- a use-after-free
+	   followed by a double free, on the most timing-sensitive transfer in
+	   the whole checkm8 sequence. Only ever reachable through the libusb
+	   backend, which nothing exercised until blackb0x-pwn was built for
+	   non-Apple platforms. */
 	usb_transfer->flags |= LIBUSB_TRANSFER_FREE_BUFFER;
 	error = libusb_submit_transfer(usb_transfer);
 	if(error != 0) {
-		free(buffer);
+		libusb_free_transfer(usb_transfer);
 		return error;
 	}
 
 	usleep(u_time);
 
-	error = libusb_cancel_transfer(usb_transfer);
-	if(error != 0) {
-		free(buffer);
-		return error;
-	}
-	free(buffer);
+	/* LIBUSB_ERROR_NOT_FOUND here just means the transfer finished on its
+	   own before the cancel landed -- not a failure, and the completion
+	   callback still has to be collected below either way. Any other error
+	   leaves the transfer in an unknown state, so wait it out rather than
+	   freeing a transfer that may still be in flight. */
+	libusb_cancel_transfer(usb_transfer);
 
-	while(transfer.ret != LIBUSB_TRANSFER_CANCELLED){
-		libusb_handle_events_completed(libirecovery_context, NULL);
+	/* Waits for the callback to have run at all, not for one specific
+	   status: a transfer that completed instead of being cancelled reports
+	   LIBUSB_TRANSFER_COMPLETED, and the old "spin until ret ==
+	   LIBUSB_TRANSFER_CANCELLED" condition never became false in that case,
+	   hanging here forever. */
+	while(!transfer.completed) {
+		if(libusb_handle_events_completed(libirecovery_context, NULL) != LIBUSB_SUCCESS) {
+			break;
+		}
 	}
-	return transfer.len;
+
+	int transferred = (int)transfer.len;
+	libusb_free_transfer(usb_transfer);
+	return transferred;
 #endif
 #else
 	return IRECV_E_UNSUPPORTED;
