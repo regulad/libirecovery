@@ -1402,6 +1402,50 @@ static int check_context(irecv_client_t client)
 
 #ifndef USE_DUMMY
 #ifdef HAVE_IOKIT
+/* Same request as iokit_usb_control_transfer() below, but reports how much
+   the host controller believes actually moved even when the outcome was a
+   timeout or a stall. DeviceRequestTO() populates req.wLenDone regardless of
+   the IOReturn it reports; the ordinary wrapper reads it only in the
+   kIOReturnSuccess case and throws it away otherwise, which makes a partial
+   transfer indistinguishable from one that moved nothing. That distinction is
+   the whole question in the checkm8 investigation (see docs/HISTORY.md in the
+   blackb0x tree), so this variant exists purely to preserve it.
+
+   `transferred` may be NULL. Caveat worth keeping in mind at the call site:
+   wLenDone on a timeout is what the HOST believes it sent, which is not
+   necessarily what the device accepted. */
+static int iokit_usb_control_transfer_ex(irecv_client_t client, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, unsigned char *data, uint16_t w_length, unsigned int timeout, int *transferred)
+{
+	IOReturn result;
+	IOUSBDevRequestTO req;
+
+	bzero(&req, sizeof(req));
+	req.bmRequestType     = bm_request_type;
+	req.bRequest          = b_request;
+	req.wValue            = OSSwapLittleToHostInt16(w_value);
+	req.wIndex            = OSSwapLittleToHostInt16(w_index);
+	req.wLength           = OSSwapLittleToHostInt16(w_length);
+	req.pData             = data;
+	req.noDataTimeout     = timeout;
+	req.completionTimeout = timeout;
+
+	result = (*client->handle)->DeviceRequestTO(client->handle, &req);
+
+	if (transferred)
+		*transferred = (int)req.wLenDone;
+
+	switch (result) {
+		case kIOReturnSuccess:         return req.wLenDone;
+		case kIOUSBPipeStalled:        return IRECV_E_PIPE;
+		case kIOReturnTimeout:         return IRECV_E_TIMEOUT;
+		case kIOUSBTransactionTimeout: return IRECV_E_TIMEOUT;
+		case kIOReturnNotResponding:   return IRECV_E_NO_DEVICE;
+		case kIOReturnNoDevice:	       return IRECV_E_NO_DEVICE;
+		default:
+			return IRECV_E_UNKNOWN_ERROR;
+	}
+}
+
 static int iokit_usb_control_transfer(irecv_client_t client, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, unsigned char *data, uint16_t w_length, unsigned int timeout)
 {
 	IOReturn result;
@@ -1435,6 +1479,120 @@ static int iokit_usb_control_transfer(irecv_client_t client, uint8_t bm_request_
 #endif
 #endif
 #endif
+
+#if !defined(USE_DUMMY) && !defined(_WIN32) && !defined(HAVE_IOKIT)
+/* Completion state for the libusb half of irecv_usb_control_transfer_ex().
+   Distinct from irecv_async_transfer above, which accumulates across the
+   async-cancel path; this one describes exactly one transfer. */
+struct irecv_sync_transfer {
+	int completed;
+	int status;
+	int actual_length;
+};
+
+static void sync_ex_cb(struct libusb_transfer* usb_transfer) {
+	struct irecv_sync_transfer* t = usb_transfer->user_data;
+	t->status = usb_transfer->status;
+	t->actual_length = usb_transfer->actual_length;
+	t->completed = 1;
+}
+#endif
+
+/* irecv_usb_control_transfer() that additionally reports how many bytes the
+   host controller believes moved, even when the transfer stalled or timed
+   out.
+
+   The return value is byte-for-byte the same as irecv_usb_control_transfer()'s
+   on every backend -- including its documented failure to normalise error
+   codes between IOKit and libusb -- so this is a drop-in replacement and
+   callers keep whatever spelling they already check for.
+
+   The libusb half is deliberately a reimplementation of libusb's own
+   synchronous control wrapper (sync.c) rather than a call to it:
+   libusb_control_transfer() collapses a partial transfer into
+   LIBUSB_ERROR_TIMEOUT and discards transfer->actual_length, which is the one
+   number this function exists to return. The status->error mapping below is
+   copied from that same wrapper so the two agree.
+
+   `transferred` may be NULL, in which case this is exactly
+   irecv_usb_control_transfer(). It is set to 0, not left untouched, whenever
+   the count is genuinely unknown. */
+IRECV_API int irecv_usb_control_transfer_ex(irecv_client_t client, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, unsigned char *data, uint16_t w_length, unsigned int timeout, int *transferred)
+{
+	if (transferred)
+		*transferred = 0;
+#ifdef USE_DUMMY
+	return IRECV_E_UNSUPPORTED;
+#else
+#ifndef _WIN32
+#ifdef HAVE_IOKIT
+	return iokit_usb_control_transfer_ex(client, bm_request_type, b_request, w_value, w_index, data, w_length, timeout, transferred);
+#else
+	struct irecv_sync_transfer state;
+	struct libusb_transfer* usb_transfer;
+	unsigned char* buffer;
+	int error;
+
+	buffer = malloc((size_t)w_length + LIBUSB_CONTROL_SETUP_SIZE);
+	if (!buffer) {
+		return IRECV_E_OUT_OF_MEMORY;
+	}
+	usb_transfer = libusb_alloc_transfer(0);
+	if (!usb_transfer) {
+		free(buffer);
+		return IRECV_E_OUT_OF_MEMORY;
+	}
+
+	libusb_fill_control_setup(buffer, bm_request_type, b_request, w_value, w_index, w_length);
+	if (w_length && (bm_request_type & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_OUT && data) {
+		memcpy(buffer + LIBUSB_CONTROL_SETUP_SIZE, data, w_length);
+	}
+
+	bzero(&state, sizeof(state));
+	libusb_fill_control_transfer(usb_transfer, client->handle, buffer, sync_ex_cb, &state, timeout);
+	/* libusb owns `buffer` from here and frees it in libusb_free_transfer();
+	   never free it separately. Same ownership rule (and the same past bug)
+	   as irecv_async_usb_control_transfer_with_cancel() above. */
+	usb_transfer->flags |= LIBUSB_TRANSFER_FREE_BUFFER;
+
+	error = libusb_submit_transfer(usb_transfer);
+	if (error != LIBUSB_SUCCESS) {
+		libusb_free_transfer(usb_transfer);
+		return error;
+	}
+
+	while (!state.completed) {
+		if (libusb_handle_events_completed(libirecovery_context, &state.completed) != LIBUSB_SUCCESS) {
+			break;
+		}
+	}
+
+	if (transferred)
+		*transferred = state.actual_length;
+
+	if (w_length && (bm_request_type & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN && data && state.actual_length > 0) {
+		memcpy(data, libusb_control_transfer_get_data(usb_transfer), (size_t)state.actual_length);
+	}
+
+	switch (state.status) {
+		case LIBUSB_TRANSFER_COMPLETED: error = state.actual_length;        break;
+		case LIBUSB_TRANSFER_TIMED_OUT: error = LIBUSB_ERROR_TIMEOUT;       break;
+		case LIBUSB_TRANSFER_STALL:     error = LIBUSB_ERROR_PIPE;          break;
+		case LIBUSB_TRANSFER_NO_DEVICE: error = LIBUSB_ERROR_NO_DEVICE;     break;
+		case LIBUSB_TRANSFER_OVERFLOW:  error = LIBUSB_ERROR_OVERFLOW;      break;
+		case LIBUSB_TRANSFER_ERROR:
+		case LIBUSB_TRANSFER_CANCELLED: error = LIBUSB_ERROR_IO;            break;
+		default:                        error = LIBUSB_ERROR_OTHER;         break;
+	}
+
+	libusb_free_transfer(usb_transfer);
+	return error;
+#endif
+#else
+	return IRECV_E_UNSUPPORTED;
+#endif
+#endif
+}
 
 int irecv_usb_control_transfer(irecv_client_t client, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, unsigned char *data, uint16_t w_length, unsigned int timeout)
 {
